@@ -1,0 +1,73 @@
+version: '2.4'
+
+services:
+  frontend-dev:
+    # build:
+    #   context: ./frontend
+    # user: "${UID}:${GID}"
+    user: "1000:1000"
+    image: node:16.3.0-alpine3.13
+    volumes:
+      - ./frontend:/app
+    working_dir: /app
+    # command: npm install -g npm@7.19.1
+    # command: id
+    command: npm install && npm start
+    ports:
+      - 3000:3000
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: build.Dockerfile
+    image: socnet-chat-frontend
+    ports:
+      - 8080:80
+
+  backend:
+    user: "1000:1000"
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: python app.py
+    volumes:
+      - ./backend:/app
+    ports:
+      - 8080:8080
+    depends_on:
+      - db_shard_1
+      - db_shard_2
+
+  db_shard_1:
+    image: mysql:5.7.33
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_DATABASE: socnet
+      MYSQL_USER: socnet
+      MYSQL_PASSWORD: socnetpass
+      LANG: C.UTF-8
+
+    ports:
+      # to connect from localhost
+      - 127.0.0.1:3306:3306
+    volumes:
+      - ./.data_db_shard_1:/var/lib/mysql
+      - ./db/master.cnf:/etc/mysql/mysql.conf.d/mysqld.cnf
+    mem_limit: 6000M
+
+  db_shard_2:
+    image: mysql:5.7.33
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_DATABASE: socnet
+      MYSQL_USER: socnet
+      MYSQL_PASSWORD: socnetpass
+      LANG: C.UTF-8
+
+    ports:
+      # to connect from localhost
+      - 127.0.0.1:3306:3306
+    volumes:
+      - ./.data_db_shard_1:/var/lib/mysql
+      - ./db/master.cnf:/etc/mysql/mysql.conf.d/mysqld.cnf
+    mem_limit: 6000M

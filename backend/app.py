@@ -1,10 +1,12 @@
 import asyncio
 import base64
 import datetime
+from collections import namedtuple
 from typing import Dict
 from typing import List
 
 import aiomysql
+import anyio
 from aiohttp import web
 import socketio
 from utils import extract_database_credentials, close_db_pool
@@ -21,16 +23,20 @@ app = web.Application()
 sio.attach(app)
 
 
+Message = namedtuple('Message', ['write_shards', 'timestamp', 'author_id', 'chat_id', 'content', 'chat_key'])
+ChatSession = namedtuple('ChatSession', ['chat_id', 'chat_key', 'user_id', 'q', 'sid'])
+Chat = namedtuple('Chat', ['chat_id', 'users', 'sessions', 'shards'])
+
+
 @sio.event
 async def message_get(sid):
-    # await sio.emit('messages', messages)
     if sid not in app['sessions']:
         await sio.emit('error', {'data': 'sid not in sessions'}, room=sid)
         return
 
-    session = app['sessions'][sid]
-    chat_id = session.get('chat_id')
-    chat_key = session.get('chat_key')
+    session: ChatSession = app['sessions'][sid]
+    chat_id = session.chat_id
+    chat_key = session.chat_key
 
     if not chat_id or not chat_key:
         await sio.emit('error', {'data': 'wrong chat_id in session'}, room=sid)
@@ -63,24 +69,42 @@ async def message_get(sid):
 
 async def insert_messages_from_queue(messages_queue: asyncio.Queue):
     while True:
-        msg = await messages_queue.get()
+        msg: Message = await messages_queue.get()
+
+        for shard_id in msg.write_shards:
+            shard = app['shards'][shard_id]
+            async with shard.acquire() as conn:
+                cur: aiomysql.cursors.Cursor
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        'INSERT INTO chat_message(shard_id, chat_id, timestamp, author_id, content) '
+                        'VALUES(%(shard_id)s, %(chat_id)s, %(timestamp)s, %(author_id)s, %(content)s) ',
+                        dict(shard_id=shard_id, chat_id=msg.chat_id, timestamp=msg.timestamp, author_id=msg.author_id,
+                             content=msg.content)
+                    )
+
+        # await sio.emit('message', message, room=sid)
+        await sio.emit('message', dict(content=msg.content, timestamp=msg.timestamp,
+                                       chat_id=msg.chat_id, author_id=msg.author_id),
+                       room=msg.chat_key)
+        await update_shards_stats()
 
 
 async def collect_messages(messages_queue: asyncio.Queue):
     while True:
         message = None
-        for session in app['sessions']:
+        session: ChatSession
+        for session in app['sessions'].values():
             message = None
-            if 'q' not in session:
-                continue
+
             try:
-                message = session['q'].get_nowait()
+                message = session.q.get_nowait()
                 messages_queue.put_nowait(message)
                 messages_queue.task_done()
             except asyncio.QueueEmpty:
                 pass
             except asyncio.QueueFull:
-                session['q'].put_nowait(message)
+                session.q.put_nowait(message)
         if not message:
             # чтобы при пустых очередях не съесть 100% CPU
             await asyncio.sleep(1)
@@ -88,7 +112,6 @@ async def collect_messages(messages_queue: asyncio.Queue):
 
 @sio.event
 async def message_add(sid, message):
-    # messages.append(message)
     # TODO: queue
 
     if sid not in app['sessions']:
@@ -96,8 +119,8 @@ async def message_add(sid, message):
         return
 
     session = app['sessions'][sid]
-    chat_id = session.get('chat_id')
-    chat_key = session.get('chat_key')
+    chat_id = session.chat_id
+    chat_key = session.chat_key
 
     if not chat_id or not chat_key:
         await sio.emit('error', {'data': 'wrong chat_id in session'}, room=sid)
@@ -111,24 +134,19 @@ async def message_add(sid, message):
         await sio.emit('error', {'data': 'no write_shards for chat'}, room=sid)
         return
 
-    author_id = session['user_id']
+    author_id = session.user_id
 
     timestamp = datetime.datetime.utcnow().isoformat()
-    for shard_id in write_shards:
-        shard = app['shards'][shard_id]
-        async with shard.acquire() as conn:
-            cur: aiomysql.cursors.Cursor
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    'INSERT INTO chat_message(shard_id, chat_id, timestamp, author_id, content) '
-                    'VALUES(%(shard_id)s, %(chat_id)s, %(timestamp)s, %(author_id)s, %(content)s) ',
-                    dict(shard_id=shard_id, chat_id=chat_id, timestamp=timestamp, author_id=author_id,
-                         content=message['content'])
-                )
+    msg = Message(
+        write_shards=write_shards,
+        timestamp=timestamp,
+        author_id=author_id,
+        chat_id=chat_id,
+        content=message['content'],
+        chat_key=chat_key)
 
-    # await sio.emit('message', message, room=sid)
-    await sio.emit('message', dict(message, timestamp=timestamp, chat_id=chat_id, author_id=author_id), room=chat_key)
-    await update_shards_stats()
+    q: asyncio.Queue = session.q
+    await q.put(msg)
 
 
 @sio.event
@@ -158,29 +176,25 @@ async def disconnect_request(sid):
     await sio.disconnect(sid)
 
 
+async def disconect_with_error(sid, error):
+    await sio.emit('error', {'data': error}, room=sid)
+    await sio.disconnect(sid)
+
+
 @sio.event
 async def connect(sid, environ):
     chat_key = environ['aiohttp.request'].query.get('chat_key')
     session = environ['aiohttp.request'].query.get('session')
     if not (chat_key and session):
-        await sio.emit('error', {'data': 'chat_key and session required'}, room=sid)
-        await sio.disconnect(sid)
-        return
+        return await disconect_with_error(sid, 'chat_key and session required')
 
     # check session and get user id
     user_session = await aiohttp_session.get_session(environ['aiohttp.request'])
     if not user_session:
-        await sio.emit('error', {'data': 'wrong session'}, room=sid)
-        await sio.disconnect(sid)
-        return
+        return await disconect_with_error(sid, 'wrong session')
 
     user_id = user_session['uid']
 
-    sio.enter_room(sid, room=chat_key)
-    app['sessions'][sid] = {
-        'chat_key': chat_key,
-        'user_id': user_id
-    }
 
     db = app['db']
 
@@ -202,21 +216,35 @@ async def connect(sid, environ):
                         app['chats'][chat_key] = {
                             'chat_id': row['chat_id'],
                             'users': {},
+                            'sessions': set(),
                             'shards': await get_shards(row['chat_id'], conn=conn)
                         }
+                    else:
+                        app['chats'][chat_key]['sessions'].add(sid)
 
                     chat = app['chats'][chat_key]
                     chat_user_id = row['user_id']
-                    if chat_user_id not in app['users']:
-                        app['users'][chat_user_id] = {
-                            'firstname': row['firstname'],
-                            'lastname': row['lastname'],
-                            'username': row['username'],
-                        }
+                    # if chat_user_id not in app['users']:
+                    #     app['users'][chat_user_id] = {
+                    #         'firstname': row['firstname'],
+                    #         'lastname': row['lastname'],
+                    #         'username': row['username'],
+                    #     }
 
-                    chat['users'][chat_user_id] = app['users'][chat_user_id]
+                    chat['users'][chat_user_id] = {
+                        'firstname': row['firstname'],
+                        'lastname': row['lastname'],
+                        'username': row['username'],
+                    }
 
-    app['sessions'][sid]['chat_id'] = app['chats'][chat_key]['chat_id']
+    app['sessions'][sid] = ChatSession(
+        sid=sid,
+        chat_key=chat_key,
+        chat_id=app['chats'][chat_key]['chat_id'],
+        user_id=user_id,
+        q=asyncio.Queue()  # limit queue and handle overflow
+    )
+    sio.enter_room(sid, room=chat_key)
     chat_users = app['chats'].get(chat_key, {}).get('users', {})
 
     await sio.emit('connected', {
@@ -264,8 +292,22 @@ async def update_shards_stats():
 
 @sio.event
 def disconnect(sid):
-    app['sessions'].pop(sid, None)
+    session: ChatSession = app['sessions'].pop(sid, None)
     logger.debug('Client disconnected %r', sid)
+
+    # clear chat if empty
+    if not session:
+        return
+
+    chat = app['chats'].get(session.chat_key, {})
+    if not chat:
+        return
+
+    chat_sessions: set = chat.get('sessions', set())
+    chat_sessions.discard(sid)
+    if not chat_sessions and chat:
+        app['chats'].pop(session.chat_key)
+        logger.debug('Clear empty chat %r', session.chat_key)
 
 
 class EncryptedSessionStorage(EncryptedCookieStorage):
@@ -302,10 +344,39 @@ async def make_app():
         app.on_shutdown.append(lambda _app: close_db_pool(pool))
 
     app['sessions'] = {}
-    app['users'] = {}
+    # app['users'] = {}
     app['chats'] = {}
-
+    app['tasks'] = []
+    app.on_startup.append(start_background_task)
+    app.on_shutdown.append(stop_tasks)
     return app
+
+
+async def start_background_task(app):
+    app['tasks'].append(asyncio.create_task(background_task(app)))
+
+
+async def stop_tasks(app):
+    t: asyncio.Task
+    for t in app['tasks']:
+        t.cancel()
+
+    await asyncio.gather(*app['tasks'])
+
+
+async def background_task(app):
+    messages_queue = asyncio.Queue()
+    while True:
+        try:
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(insert_messages_from_queue, messages_queue)
+                tg.start_soon(collect_messages, messages_queue)
+        except asyncio.CancelledError:
+            logger.info('background_task canceled')
+            return
+        except Exception:
+            logger.exception('Exception in background task', exc_info=True)
+
 
 def main():
     logging.basicConfig(level=os.getenv('LOG_LEVEL', logging.DEBUG))

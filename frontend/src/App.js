@@ -1,12 +1,7 @@
 import './App.css';
 import React, { Component} from 'react'
-// import { io } from "socket.io-client";
-// import { useChat } from './hooks'
-// import logo from './logo.svg';
 import io from 'socket.io-client'
 
-// let _id = 1
-// function getMsgId() { return _id++ }
 
 function getPrameter(name) {
   return new URLSearchParams(window.location.search).get(name)
@@ -27,39 +22,37 @@ function getPrameter(name) {
 //   })
 // ]
 
-// const DUMMY_DATA = io.
+// function getCookie(name) {
+//   let matches = document.cookie.match(new RegExp(
+//     "(?:^|; )" + name.replace(/([.$?*|{}()[\]\\/+^])/g, '\\$1') + "=([^;]*)"
+//   ));
+//   return matches ? decodeURIComponent(matches[1]) : undefined;
+// }
 
-function getCookie(name) {
-  let matches = document.cookie.match(new RegExp(
-    "(?:^|; )" + name.replace(/([.$?*|{}()[\]\\/+^])/g, '\\$1') + "=([^;]*)"
-  ));
-  return matches ? decodeURIComponent(matches[1]) : undefined;
-}
+// function setCookie(name, value, options = {}) {
 
-function setCookie(name, value, options = {}) {
+//   options = {
+//     path: '/',
+//     // при необходимости добавьте другие значения по умолчанию
+//     ...options
+//   };
 
-  options = {
-    path: '/',
-    // при необходимости добавьте другие значения по умолчанию
-    ...options
-  };
+//   if (options.expires instanceof Date) {
+//     options.expires = options.expires.toUTCString();
+//   }
 
-  if (options.expires instanceof Date) {
-    options.expires = options.expires.toUTCString();
-  }
+//   let updatedCookie = encodeURIComponent(name) + "=" + encodeURIComponent(value);
 
-  let updatedCookie = encodeURIComponent(name) + "=" + encodeURIComponent(value);
+//   for (let optionKey in options) {
+//     updatedCookie += "; " + optionKey;
+//     let optionValue = options[optionKey];
+//     if (optionValue !== true) {
+//       updatedCookie += "=" + optionValue;
+//     }
+//   }
 
-  for (let optionKey in options) {
-    updatedCookie += "; " + optionKey;
-    let optionValue = options[optionKey];
-    if (optionValue !== true) {
-      updatedCookie += "=" + optionValue;
-    }
-  }
-
-  document.cookie = updatedCookie;
-}
+//   document.cookie = updatedCookie;
+// }
 
 
 class MessageList extends Component {
@@ -153,10 +146,6 @@ class App extends Component {
       userId: null,
       sio: null
     }
-    // this.hooks = {
-    //   sendMessage: sendMessage,
-    //   removeMessage: removeMessage
-    // }
 
     this.messageListRef = React.createRef()
     this.sendMessage = this.sendMessage.bind(this)
@@ -166,19 +155,6 @@ class App extends Component {
     if (!messageText) { return }
     if (!this.state.sio) { return }
     if (!this.state.userId) { return }
-
-    // const message = {
-    //   senderId: "janedoe",
-    //   text: msg
-    // }
-    // this.setState({
-    //   messages: [...this.state.messages, message]
-    // })
-
-    // const messageList = this.messageListRef.current
-    // messageList.scroll(0, messageList.scrollHeight)
-
-    // const userId = 1001004;
 
     this.state.sio.emit('message_add', {
       author_id: this.state.userId,
@@ -190,28 +166,14 @@ class App extends Component {
 
   componentDidMount(){
     console.log('reconnect')
-    // const roomId = 1
-    // const userId = this.props.userId || 1001004
     const session = getPrameter('session')
     const chat_key = getPrameter('chat_key')
     const userId = parseInt(getPrameter('userId'))
 
-    // setCookie('AIOHTTP_SESSION', session)
-    // console.log(getCookie('AIOHTTP_SESSION'))
-
     const sio = io(SERVER_URL, {
-      // query: { roomId,  session: getCookie('AIOHTTP_SESSION') }
       query: { chat_key, session }
     })
     this.setState({ sio, userId })
-
-    // const sendMessage = ({ messageText }) => {
-    //     sio.emit('message_add', {
-    //         authorId: userId,
-    //         content: messageText,
-    //         // senderName
-    //     })
-    // }
 
     // const removeMessage = (id) => {
     //     sio.emit('message_remove', id)
@@ -241,17 +203,11 @@ class App extends Component {
     })
 
     sio.on('chat_response', (messages) => {
-        // const newMessages = messages.map((msg) =>
-        //     msg.userId && msg.userId === userId ? { ...msg, currentUser: true } : msg
-        // )
-        // setMessages(newMessages)
         console.log(messages)
     })
   }
 
   render() {
-    // const roomId = 1
-    // const { users, messages, sendMessage, removeMessage } = useChat(roomId)
     return (
       <div className="app">
         <Title />
@@ -265,65 +221,6 @@ class App extends Component {
 }
 
 
-
-// const App = () => {
-//     // super()
-//     // this.state = {
-//     //   messages: messages,
-//     //   users: users
-//     // }
-//     // // this.hooks = {
-//     //   sendMessage: sendMessage,
-//     //   removeMessage: removeMessage
-//     // }
-
-//     //   this.messageListRef = React.createRef()
-//     //   this.sendMessage = this.sendMessage.bind(this)
-//     // }
-
-//     // sendMessage(msg){
-//     //   if (!msg) { return }
-
-//     //   const message = {
-//     //     senderId: "janedoe",
-//     //     text: msg
-//     //   }
-//     //   this.setState({
-//     //     messages: [...this.state.messages, message]
-//     //   })
-
-//     //   // const messageList = this.messageListRef.current
-//     //   // messageList.scroll(0, messageList.scrollHeight)
-//     // }
-
-//     const [messages, setMessages] = useState([])
-//     const addMessage = (message, userId) => {
-//       const newMessages = [...messages,
-//       message.authorId && message.authorId === userId ?
-//         { ...message, currentUser: true } : message
-//       ]
-//       setMessages(newMessages)
-//     }
-//     const roomId = 1;
-//     // const { users, messages, sendMessage, removeMessage } = useChat(roomId)
-//     const { users, sendMessage, removeMessage } = useChat(roomId, addMessage, setMessages)
-//     // console.log(users, removeMessage)
-//     const messageListRef = React.createRef()
-//     return (
-//       <div className="app">
-//         <Title />
-//         <MessageList
-//           messages={messages}
-//           removeMessage={removeMessage}
-//           listRef={messageListRef} />
-//         <SendMessageForm
-//           sendMessage={sendMessage}
-//           users={users}
-//         />
-//       </div>
-//     )
-
-// }
 
 
 export default App;

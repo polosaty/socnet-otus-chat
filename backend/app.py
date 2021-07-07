@@ -276,18 +276,22 @@ async def update_shards_stats():
         async with shard.acquire() as conn:
             cur: aiomysql.cursors.DictCursor
             async with conn.cursor(aiomysql.DictCursor) as cur:
-                await cur.execute('select coalesce(max(id), 0) as max_id from chat_message')
-                stats[shard_id] = (await cur.fetchone())['max_id']
+                # await cur.execute('select coalesce(max(id), 0) as max_id from chat_message')
+                await cur.execute(
+                    "select TABLE_ROWS from information_schema.TABLES "
+                    "where TABLES.TABLE_SCHEMA = 'socnet' and TABLE_NAME = 'chat_message'")
+                stats[shard_id] = (await cur.fetchone())['TABLE_ROWS']
 
     if stats:
         async with app['db'].acquire() as conn:
             cur: aiomysql.cursors.Cursor
             async with conn.cursor() as cur:
-                await cur.executemany(
-                    "REPLACE into shard (id, max_chat_message_id) "
-                    " VALUES  (%s, %s)",
-                    [(shard_id, max_id) for shard_id, max_id in stats.items()]
-                )
+                for shard_id, size in stats.items():
+                    await cur.execute(
+                        "UPDATE shard SET size = %(size)s "
+                        " WHERE id = %(shard_id)s",
+                       dict(shard_id=shard_id, size=size)
+                    )
 
 
 @sio.event

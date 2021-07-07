@@ -45,6 +45,7 @@
     --main-text-color: #3e5869;
     --secondary-text-color: #b0c7d6;
     --send-message-form: #F5F5F5;
+    --my-message: #d9ffb5;
 }
 
 html, body {
@@ -93,6 +94,17 @@ html, body {
     display: inline;
     padding: 4px 8px;
     border-radius: 8px;
+}
+
+.my{
+    display: flex;
+    flex-direction: row-reverse;
+
+}
+
+.my div:nth-child(2) {
+    background: var(--my-message);
+    color: var(--main-text-color);
 }
 
 .message-list {

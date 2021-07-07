@@ -12,7 +12,7 @@ services:
     working_dir: /app
     # command: npm install -g npm@7.19.1
     # command: id
-    command: npm install && npm start
+    command: npm start
     ports:
       - 3000:3000
 
@@ -30,13 +30,20 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     command: python app.py
+    environment:
+      FERNET_KEY: 'sIv6jBFwPkNSZP4gVUmzQUnsaMs7g1g7UMRStf5RpCM='
+      DATABASE_URL: mysql://socnet:socnetpass@db:3306/socnet
+      SHARDS_COUNT: 2
+      SHARD_1_URL: mysql://socnet:socnetpass@db_shard_1:3306/socnet
+      SHARD_2_URL: mysql://socnet:socnetpass@db_shard_2:3306/socnet
     volumes:
       - ./backend:/app
     ports:
-      - 8080:8080
-    depends_on:
-      - db_shard_1
-      - db_shard_2
+      - 8088:8080
+    # depends_on:
+    #   - db
+    #   - db_shard_1
+    #   - db_shard_2
 
   db_shard_1:
     image: mysql:5.7.33
@@ -49,10 +56,10 @@ services:
 
     ports:
       # to connect from localhost
-      - 127.0.0.1:3306:3306
+      - 127.0.0.1:3309:3306
     volumes:
       - ./.data_db_shard_1:/var/lib/mysql
-      - ./db/master.cnf:/etc/mysql/mysql.conf.d/mysqld.cnf
+      - ./db/shard_1.cnf:/etc/mysql/mysql.conf.d/mysqld.cnf
     mem_limit: 6000M
 
   db_shard_2:
@@ -66,8 +73,19 @@ services:
 
     ports:
       # to connect from localhost
-      - 127.0.0.1:3306:3306
+      - 127.0.0.1:3310:3306
     volumes:
-      - ./.data_db_shard_1:/var/lib/mysql
-      - ./db/master.cnf:/etc/mysql/mysql.conf.d/mysqld.cnf
+      - ./.data_db_shard_2:/var/lib/mysql
+      - ./db/shard_2.cnf:/etc/mysql/mysql.conf.d/mysqld.cnf
     mem_limit: 6000M
+
+  db:
+     extends:
+      file: ../social_net/docker-compose.yml
+      service: db
+
+  adminer:
+    image: adminer
+    restart: always
+    ports:
+      - 8081:8080

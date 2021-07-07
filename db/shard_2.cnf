@@ -46,3 +46,6 @@ log_bin = /var/lib/mysql/mysql-bin.log
 gtid_mode=ON
 log-slave-updates
 enforce-gtid-consistency
+
+auto_increment_offset = 4
+auto_increment_increment = 128

@@ -1,0 +1,4 @@
+/.data*
+/.idea
+.ash_history
+__pycache__

@@ -319,6 +319,20 @@ class EncryptedSessionStorage(EncryptedCookieStorage):
         return request.query.get('session')
 
 
+async def migrate_schema(pool):
+    conn: aiomysql.connection.Connection
+    async with pool.acquire() as conn:
+        cur: aiomysql.cursors.Cursor
+        async with conn.cursor() as cur:
+            try:
+                await cur.execute("SELECT 1 FROM chat_message LIMIT 1")
+                await cur.fetchone()
+            except Exception:
+                with open("shard_schema.sql") as f:
+                    schema = f.read()
+                    await cur.execute(schema)
+
+
 async def make_app():
     database_url = os.getenv('DATABASE_URL', None)
 
@@ -345,6 +359,7 @@ async def make_app():
             maxsize=20,
             autocommit=True)
         app['shards'][i + 1] = pool
+        await migrate_schema(pool)
         app.on_shutdown.append(lambda _app: close_db_pool(pool))
 
     app['sessions'] = {}

@@ -22,7 +22,7 @@ services:
       dockerfile: build.Dockerfile
     image: socnet-chat-frontend
     ports:
-      - 8080:80
+      - 3000:80
 
   backend:
     user: "1000:1000"

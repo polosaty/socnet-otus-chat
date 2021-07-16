@@ -29,13 +29,19 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    command: python app.py
+    command: ash -c "/wait && python app.py"
     environment:
+      WAIT_HOSTS: db:3306, db_shard_1:3306, db_shard_2:3306
+      WAIT_HOSTS_TIMEOUT: 300
+      WAIT_SLEEP_INTERVAL: 30
+      WAIT_HOST_CONNECT_TIMEOUT: 30
+
       FERNET_KEY: 'sIv6jBFwPkNSZP4gVUmzQUnsaMs7g1g7UMRStf5RpCM='
       DATABASE_URL: mysql://socnet:socnetpass@db:3306/socnet
       SHARDS_COUNT: 2
       SHARD_1_URL: mysql://socnet:socnetpass@db_shard_1:3306/socnet
       SHARD_2_URL: mysql://socnet:socnetpass@db_shard_2:3306/socnet
+
     volumes:
       - ./backend:/app
     ports:

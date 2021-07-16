@@ -1,5 +1,8 @@
+import logging
+from typing import Any, Dict
 from urllib.parse import urlparse
-from typing import Dict, Any
+
+logger = logging.getLogger(__name__)
 
 
 def extract_database_credentials(database_url) -> Dict[str, Any]:
@@ -18,5 +21,6 @@ def extract_database_credentials(database_url) -> Dict[str, Any]:
 
 
 async def close_db_pool(dp_pool):
+    logger.debug('closing db pool %r', dp_pool)
     dp_pool.close()
     await dp_pool.wait_closed()

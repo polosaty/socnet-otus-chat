@@ -184,11 +184,13 @@ class App extends Component {
         sio.emit('message_get')
     })
 
+    sio.on('disconnect', () => {
+        sio.connect()
+    })
 
     sio.on('users', (users) => {
         this.setState({ users })
     })
-
 
     sio.on('messages', (messages) => {
         const newMessages = messages.map((msg) =>

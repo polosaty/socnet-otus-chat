@@ -4,17 +4,21 @@ from collections import namedtuple
 import datetime
 import logging
 import os
+import signal
 
 from aiohttp import web
 import aiohttp_session
 from aiohttp_session.cookie_storage import EncryptedCookieStorage
 import aiomysql
+# import aiojaeger as az
+import aiozipkin as az
 import anyio
 from cryptography import fernet
 import socketio
 
 from models import Chat
 from models import Message
+from models import User
 from utils import close_db_pool
 from utils import extract_database_credentials
 
@@ -139,21 +143,21 @@ async def message_add(sid, message):
 @sio.event
 async def join(sid, message):
     sio.enter_room(sid, message['room'])
-    await sio.emit('chat_response', {'data': 'Entered room: ' + message['room']},
+    await sio.emit('chat_response', {'data': f'Entered room: {message["room"]}'},
                    room=sid)
 
 
 @sio.event
 async def leave(sid, message):
     sio.leave_room(sid, message['room'])
-    await sio.emit('chat_response', {'data': 'Left room: ' + message['room']},
+    await sio.emit('chat_response', {'data': f'Left room: {message["room"]}'},
                    room=sid)
 
 
 @sio.event
 async def close_room(sid, message):
     await sio.emit('chat_response',
-                   {'data': 'Room ' + message['room'] + ' is closing.'},
+                   {'data': f'Room {message["room"]} is closing.'},
                    room=message['room'])
     await sio.close_room(message['room'])
 
@@ -163,22 +167,23 @@ async def disconnect_request(sid):
     await sio.disconnect(sid)
 
 
-async def disconect_with_error(sid, error):
+async def disconnect_with_error(sid, error):
     await sio.emit('error', {'data': error}, room=sid)
     await sio.disconnect(sid)
 
 
 @sio.event
 async def connect(sid, environ):
-    chat_key = environ['aiohttp.request'].query.get('chat_key')
-    session = environ['aiohttp.request'].query.get('session')
+    request = environ['aiohttp.request']
+    chat_key = request.query.get('chat_key')
+    session = request.query.get('session')
     if not (chat_key and session):
-        return await disconect_with_error(sid, 'chat_key and session required')
+        return await disconnect_with_error(sid, 'chat_key and session required')
 
     # check session and get user id
     user_session = await aiohttp_session.get_session(environ['aiohttp.request'])
     if not user_session:
-        return await disconect_with_error(sid, 'wrong session')
+        return await disconnect_with_error(sid, 'wrong session')
 
     user_id = user_session['uid']
 
@@ -187,6 +192,8 @@ async def connect(sid, environ):
     if chat_key not in app['chats']:
         async with db.acquire() as conn:
             chat = await Chat.load(chat_key, conn)
+            if not chat:
+                return await disconnect_with_error(sid, 'cant get chat by key')
             app['chats'][chat_key] = chat
     else:
         chat = app['chats'][chat_key]
@@ -200,10 +207,10 @@ async def connect(sid, environ):
         q=asyncio.Queue()  # limit queue and handle overflow
     )
     sio.enter_room(sid, room=chat_key)
-    chat_users = chat.users
 
+    user: User
     await sio.emit('connected', {
-        'users': chat_users
+        'users': {_id: user._asdict() for _id, user in chat.users.items()}
     }, room=sid)
 
     logger.debug('Client connected %r', sid)
@@ -251,6 +258,8 @@ def disconnect(sid):
     if not chat_sessions:
         app['chats'].pop(session.chat_key)
         logger.debug('Clear empty chat %r', session.chat_key)
+        # asyncio.create_task(sio.close_room(session.chat_key))
+        # logger.debug('Close empty room %r', session.chat_key)
 
 
 class EncryptedSessionStorage(EncryptedCookieStorage):
@@ -273,8 +282,14 @@ async def migrate_schema(pool):
                     await cur.execute(schema)
 
 
-async def make_app():
+async def make_app(host, port):
     database_url = os.getenv('DATABASE_URL', None)
+
+    app['instance_id'] = os.getenv('INSTANCE_ID', '1')
+    jaeger_address = os.getenv('JAEGER_ADDRESS', 'http://jaeger:9411/api/v2/spans')
+    endpoint = az.create_endpoint(f"chat_backend_{app['instance_id']}", ipv4=host, port=port)
+    tracer = await az.create(jaeger_address, endpoint, sample_rate=1.0)
+    az.setup(app, tracer)
 
     fernet_key = os.getenv('FERNET_KEY', fernet.Fernet.generate_key())
     secret_key = base64.urlsafe_b64decode(fernet_key)
@@ -318,8 +333,15 @@ async def make_app():
     app['tasks'] = []
     app.on_startup.append(start_background_task)
 
-    # app.on_shutdown.append(close_shards)
+    app.on_shutdown.append(disconnect_all_sids)
     return app
+
+
+async def disconnect_all_sids(app):
+    logger.debug('disconnect all sids')
+    if sio.eio.sockets:
+        await sio.eio.disconnect()
+    logger.debug('disconnect all sids [OK]')
 
 
 async def close_shards(app):
@@ -334,8 +356,9 @@ async def close_shards(app):
 
 async def stop_sessions(app):
     logger.debug('stop_sessions')
-    session: ChatSession
-    for session in app['sessions'].values():
+    # session: ChatSession
+    # while app['sessions']:
+    for session in list(app['sessions'].values()):
         await sio.disconnect(session.sid)
     logger.debug('stop_sessions [OK]')
 
@@ -350,7 +373,7 @@ async def start_background_task(app):
 
 
 async def stop_tasks(app):
-    logger.debug('stoping tasks')
+    logger.debug('stopping tasks')
     t: asyncio.Task
     for t in app['tasks']:
         logger.debug('cancel task: %r', t)
@@ -359,7 +382,7 @@ async def stop_tasks(app):
         logger.debug('cancel task: %r [OK]', t)
 
     # await asyncio.gather(*app['tasks'])
-    logger.debug('stoping tasks finished')
+    logger.debug('stopping tasks [OK]')
 
 
 async def background_task(app):
@@ -376,48 +399,94 @@ async def background_task(app):
             logger.exception('Exception in background task', exc_info=True)
 
 
-async def run_app(port, host='0.0.0.0'):
+async def run_app(public_port=8080, public_host='0.0.0.0', rest_port=8081, rest_host='0.0.0.0'):
     try:
-        runner = web.AppRunner(await make_app())
-        await runner.setup()
-        site = web.TCPSite(runner, host, port)
+        app_runner = web.AppRunner(await make_app(public_host, public_port))
+        await app_runner.setup()
+        site = web.TCPSite(app_runner, public_host, public_port)
         await site.start()
 
-        import signal
-        loop = asyncio.get_event_loop()
-        state = dict(running=True)
+        rest_runner = web.AppRunner(await make_rest(rest_host, rest_port))
+        await rest_runner.setup()
+        rest = web.TCPSite(rest_runner, rest_host, rest_port)
+        await rest.start()
+
+        stop_event = asyncio.Event()
 
         def stop():
-            async def async_stop():
-                await runner.cleanup()
-                state['running'] = False
-            asyncio.create_task(async_stop())
+            stop_event.set()
 
+        loop = asyncio.get_event_loop()
         loop.add_signal_handler(signal.SIGTERM, stop)
 
-        while state['running']:
-            try:
-                await asyncio.sleep(3)
-            except (asyncio.CancelledError, KeyboardInterrupt):
-                break
-        logger.debug('shutdown')
-        await runner.cleanup()
+        try:
+            await stop_event.wait()
+        except (asyncio.CancelledError, KeyboardInterrupt) as ex:
+            logger.debug('Stopping app: %r', ex)
 
-        return runner
+        logger.debug('shutdown rest')
+        await rest_runner.shutdown()
+        await rest_runner.cleanup()
+        logger.debug('shutdown rest [OK]')
+        try:
+            await asyncio.wait_for(app_runner.shutdown(), timeout=3)
+            await asyncio.wait_for(app_runner.cleanup(), timeout=3)
+        except asyncio.TimeoutError:
+            logger.debug('tasks: %r', asyncio.all_tasks())
+
+        logger.debug('shutdown app [OK]')
+
     except asyncio.CancelledError as ex:
         logger.exception('run_app: %r', ex)
     except Exception as ex:
         logger.exception('run_app: %r', ex)
 
 
+async def rest_make_chat_handler(request: web.Request):
+    tracer = az.get_tracer(request.app)
+    span = az.request_span(request)
+    with tracer.new_child(span.context) as child_span:
+        child_span.name("parse request")
+        request_data = await request.json()
+        user_id = request_data.get('user_id')
+        friend_id = request_data.get('friend_id')
+        child_span.tag('user_id', user_id)
+        child_span.tag('friend_id', friend_id)
+        if not user_id:
+            return web.json_response({'user_id': 'required'}, status=400)
+        if not friend_id:
+            return web.json_response({'friend_id': 'required'}, status=400)
+
+    with tracer.new_child(span.context) as child_span:
+        child_span.name("mysql:get_or_create:chat")
+        pool: aiomysql.pool.Pool = app['db']
+        async with pool.acquire() as conn:
+            chat_key = await Chat.get_or_create(user_id, friend_id, conn)
+        child_span.tag('chat_key', chat_key)
+
+    return web.json_response({'chat_key': chat_key})
+
+
+async def make_rest(host, port):
+    rest = web.Application()
+    rest['instance_id'] = os.getenv('INSTANCE_ID', '1')
+    jaeger_address = os.getenv('JAEGER_ADDRESS', 'http://jaeger:9411/api/v2/spans')
+    endpoint = az.create_endpoint(f"chat_rest_{rest['instance_id']}", ipv4=host, port=port)
+    tracer = await az.create(jaeger_address, endpoint, sample_rate=1.0)
+
+    rest.add_routes([
+        web.post("/make_chat/", rest_make_chat_handler)
+    ])
+    az.setup(rest, tracer)
+    return rest
+
+
 def main():
     logging.basicConfig(level=os.getenv('LOG_LEVEL', logging.DEBUG))
-    web.run_app(make_app(), port=int(os.getenv('PORT', 8080)))
-    # anyio.run(run_app, int(os.getenv('PORT', 8080)))
-    # runner: web.AppRunner = asyncio.run(run_app(port=int(os.getenv('PORT', 8080))), debug=True)
-    # logger.debug('App shutdown')
-    # asyncio.run(runner.cleanup())
-    logger.debug('App stopped')
+    asyncio.run(run_app(public_port=int(os.getenv('PORT', 8080)),
+                        rest_port=int(os.getenv('REST_PORT', 8081))))
+    logger.debug('App shutdown')
+
 
 if __name__ == '__main__':
     main()

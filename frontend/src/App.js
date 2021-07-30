@@ -197,11 +197,14 @@ class App extends Component {
             msg.author_id && msg.author_id === this.state.userId ? { ...msg, currentUser: true } : msg
         )
         this.setState({messages: newMessages})
+
+        sio.emit('messages_read', messages.map((m) => m.id))
     })
 
     sio.on('message', (message) => {
         const msg = (message.author_id && message.author_id === this.state.userId ? { ...message, currentUser: true } : message)
         this.setState({messages: [...this.state.messages, msg]})
+        sio.emit('messages_read', [message.id])
     })
 
     sio.on('chat_response', (messages) => {

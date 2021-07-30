@@ -42,6 +42,8 @@ services:
       SHARD_1_URL: mysql://socnet:socnetpass@db_shard_1:3306/socnet
       SHARD_2_URL: mysql://socnet:socnetpass@db_shard_2:3306/socnet
 
+      PORT: 8080
+
     volumes:
       - ./backend:/app
     ports:
@@ -87,7 +89,7 @@ services:
 
   db:
      extends:
-      file: ../social_net/docker-compose.yml
+      file: ../../docker-compose.yml
       service: db
 
   adminer:

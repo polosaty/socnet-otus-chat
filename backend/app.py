@@ -1,11 +1,14 @@
 import asyncio
 import base64
 from collections import namedtuple
+from dataclasses import asdict
 import datetime
 import logging
 import os
 import signal
+from typing import List
 
+import aiohttp
 from aiohttp import web
 import aiohttp_session
 from aiohttp_session.cookie_storage import EncryptedCookieStorage
@@ -45,7 +48,7 @@ async def message_get(sid):
         await sio.emit('error', {'data': 'wrong chat_id in session'}, room=sid)
         return
 
-    chat = app['chats'][chat_key] or {}
+    chat = app['chats'][chat_key]
     read_shards = chat.shards.get('read')
 
     if not read_shards:
@@ -61,23 +64,59 @@ async def message_get(sid):
     await sio.emit('messages', messages, room=sid)
 
 
+@sio.event
+async def messages_read(sid, message_ids: List[int]):
+    if sid not in app['sessions']:
+        await sio.emit('error', {'data': 'sid not in sessions'}, room=sid)
+        return
+
+    session: ChatSession = app['sessions'][sid]
+    chat_id = session.chat_id
+    chat_key = session.chat_key
+
+    if not chat_id or not chat_key:
+        await sio.emit('error', {'data': 'wrong chat_id in session'}, room=sid)
+        return
+
+    chat: Chat = app['chats'][chat_key]
+    write_shards = chat.shards.get('write')
+
+    if not write_shards:
+        await sio.emit('error', {'data': 'no write_shards for chat'}, room=sid)
+        return
+
+    user_id = session.user_id
+    from saga import MessagesReadSaga
+
+    # не помечаем прочитанными если не удается обновить счетчик
+    if not await MessagesReadSaga(app=app, chat=chat, user=chat.users[user_id], message_ids=message_ids).do():
+        await sio.emit('error', {'data': 'can`t update counters'}, room=sid)
+        return
+
+
 async def insert_messages_from_queue(messages_queue: asyncio.Queue):
+    from saga import MessageAddSaga
     while True:
         try:
             msg: Message = await messages_queue.get()
 
-            for shard_id in msg.write_shards:
-                shard = app['shards'][shard_id]
-                async with shard.acquire() as conn:
-                    await msg.save(shard_id=shard_id, conn=conn)
+            message_add_saga = MessageAddSaga(app, msg)
+            if not await message_add_saga.do():
+                # если не удалось обновить счетчик - отправляем сообщение обратно в очередь
+                # messages_queue.put_nowait(msg)
+                continue
 
             await sio.emit('message', dict(content=msg.content, timestamp=msg.timestamp,
-                                           chat_id=msg.chat_id, author_id=msg.author_id),
+                                           chat_id=msg.chat_id, author_id=msg.author_id,
+                                           id=message_add_saga.message_id),
                            room=msg.chat_key)
-            await update_shards_stats()
+
+            await update_shards_stats()  # TODO: обновлять реже
         except asyncio.CancelledError:
             logger.debug('insert_messages_from_queue canceled')
             break
+        except Exception as ex:
+            logger.error('error in insert_messages_from_queue: %r', ex)
 
 
 async def collect_messages(messages_queue: asyncio.Queue):
@@ -191,7 +230,7 @@ async def connect(sid, environ):
 
     if chat_key not in app['chats']:
         async with db.acquire() as conn:
-            chat = await Chat.load(chat_key, conn)
+            chat = await Chat.load(chat_key, conn, app['shards'])
             if not chat:
                 return await disconnect_with_error(sid, 'cant get chat by key')
             app['chats'][chat_key] = chat
@@ -210,7 +249,7 @@ async def connect(sid, environ):
 
     user: User
     await sio.emit('connected', {
-        'users': {_id: user._asdict() for _id, user in chat.users.items()}
+        'users': {_id: asdict(user) for _id, user in chat.users.items()}
     }, room=sid)
 
     logger.debug('Client connected %r', sid)
@@ -274,7 +313,7 @@ async def migrate_schema(pool):
         cur: aiomysql.cursors.Cursor
         async with conn.cursor() as cur:
             try:
-                await cur.execute("SELECT 1 FROM chat_message LIMIT 1")
+                await cur.execute("SELECT 1 FROM read_message LIMIT 1")
                 await cur.fetchone()
             except Exception:
                 with open("shard_schema.sql") as f:
@@ -286,18 +325,30 @@ async def make_app(host, port):
     database_url = os.getenv('DATABASE_URL', None)
 
     app['instance_id'] = os.getenv('INSTANCE_ID', '1')
-    jaeger_address = os.getenv('JAEGER_ADDRESS', 'http://jaeger:9411/api/v2/spans')
-    endpoint = az.create_endpoint(f"chat_backend_{app['instance_id']}", ipv4=host, port=port)
-    tracer = await az.create(jaeger_address, endpoint, sample_rate=1.0)
-    az.setup(app, tracer)
+    jaeger_address = os.getenv('JAEGER_ADDRESS')
+    if jaeger_address:
+        endpoint = az.create_endpoint(f"chat_backend_{app['instance_id']}", ipv4=host, port=port)
+        tracer = await az.create(jaeger_address, endpoint, sample_rate=1.0)
+        trace_config = az.make_trace_config(tracer)
+        app['client_session'] = aiohttp.ClientSession(trace_configs=[trace_config])
+    else:
+        app['client_session'] = aiohttp.ClientSession()
+
+    async def close_session(app):
+        await app["client_session"].close()
+
+    app.on_cleanup.append(close_session)
 
     fernet_key = os.getenv('FERNET_KEY', fernet.Fernet.generate_key())
     secret_key = base64.urlsafe_b64decode(fernet_key)
     aiohttp_session.setup(app, EncryptedSessionStorage(secret_key))
-    # sio.start_background_task(background_task)
 
     app.on_shutdown.append(stop_tasks)
     app.on_shutdown.append(stop_sessions)
+
+    counters_rest_url = os.getenv('COUNTERS_REST_URL')
+    if counters_rest_url:
+        app['counters_rest_url'] = counters_rest_url
 
     pool = await aiomysql.create_pool(
         **extract_database_credentials(database_url),
@@ -334,6 +385,8 @@ async def make_app(host, port):
     app.on_startup.append(start_background_task)
 
     app.on_shutdown.append(disconnect_all_sids)
+    if jaeger_address:
+        az.setup(app, tracer)
     return app
 
 

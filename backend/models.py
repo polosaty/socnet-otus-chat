@@ -1,15 +1,39 @@
 from collections import namedtuple
-from typing import Dict, Iterable, List
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Set, Tuple
 
 import aiomysql
 
-BaseMessage = namedtuple('Message', ['write_shards', 'timestamp', 'author_id', 'chat_id', 'content', 'chat_key'])
-BaseChat = namedtuple('Chat', ['chat_id', 'users', 'sessions', 'shards'])
-BaseUser = namedtuple('User', ['firstname', 'lastname', 'username', 'user_id'])
+
+@dataclass
+class BaseMessage:
+    write_shards: List[int]
+    timestamp: str
+    author_id: int
+    chat_id: int
+    chat_key: str
+    content: str
+
+
+@dataclass
+class BaseUser:
+    firstname: str
+    lastname: str
+    username: str
+    user_id: int
+    unread_message_count: int
 
 
 class User(BaseUser):
     pass
+
+
+@dataclass
+class BaseChat:
+    chat_id: int
+    users: Dict[int, User]
+    sessions: Set[str]
+    shards: Dict[str, List[int]]
 
 
 class Message(BaseMessage):
@@ -22,6 +46,28 @@ class Message(BaseMessage):
                 'VALUES (%(shard_id)s, %(chat_id)s, %(timestamp)s, %(author_id)s, %(content)s) ',
                 dict(shard_id=shard_id, chat_id=self.chat_id, timestamp=self.timestamp,
                      author_id=self.author_id, content=self.content)
+            )
+            return cur.lastrowid
+
+    @classmethod
+    async def mark_read(cls, user_id, chat_id, message_id, conn):
+        cur: aiomysql.cursors.Cursor
+        async with conn.cursor() as cur:
+            await cur.execute(
+                'INSERT IGNORE INTO read_message(chat_id, user_id, message_id) '
+                'VALUES (%(chat_id)s, %(user_id)s, %(message_id)s)',
+                dict(chat_id=chat_id, user_id=user_id, message_id=message_id)
+            )
+
+    @classmethod
+    async def mark_read_many(cls, user_id, chat_id, message_ids: Iterable[int], conn):
+        cur: aiomysql.cursors.Cursor
+        async with conn.cursor() as cur:
+            await cur.executemany(
+                'INSERT IGNORE INTO read_message(chat_id, user_id, message_id) '
+                'VALUES (%(chat_id)s, %(user_id)s, %(message_id)s)',
+                [dict(chat_id=chat_id, user_id=user_id, message_id=message_id)
+                 for message_id in message_ids]
             )
 
     @classmethod
@@ -46,7 +92,7 @@ class Message(BaseMessage):
             cur: aiomysql.cursors.DictCursor
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
-                    f"SELECT DATE_FORMAT(timestamp, '%%Y-%%m-%%dT%%TZ') AS timestamp, author_id, content, chat_id "
+                    f"SELECT DATE_FORMAT(timestamp, '%%Y-%%m-%%dT%%TZ') AS timestamp, author_id, content, chat_id, id "
                     f"FROM chat_message "
                     f"WHERE chat_id = %(chat_id)s {before_timestamp_sql} "
                     f"ORDER BY timestamp DESC LIMIT %(limit)s",
@@ -74,7 +120,7 @@ class Chat(BaseChat):
         return shards
 
     @classmethod
-    async def load(cls, chat_key, conn) -> 'Chat':
+    async def load(cls, chat_key, conn, app_shards) -> 'Chat':
         chat = None
         cur: aiomysql.cursors.DictCursor
         async with conn.cursor(aiomysql.DictCursor) as cur:
@@ -102,8 +148,39 @@ class Chat(BaseChat):
                     firstname=row['firstname'],
                     lastname=row['lastname'],
                     username=row['username'],
+                    unread_message_count=await chat.get_unread_message_count(chat_user_id, app_shards),
                 )
         return chat
+
+    async def get_unread_message_count(self, user_id, app_shards, exclude_ids: Tuple[int]=None):
+        unread_message_count = 0
+
+        read_shards = self.shards.get('read')
+        exclude_ids_sql = ''
+        extra_params = {}
+        if exclude_ids:
+            exclude_ids_sql = ' AND cm.id NOT IN %(exclude_ids)s'
+            extra_params['exclude_ids'] = exclude_ids
+
+        for shard_id in read_shards:
+            shard = app_shards[shard_id]
+            async with shard.acquire() as conn:
+                cur: aiomysql.cursors.DictCursor
+                async with conn.cursor(aiomysql.DictCursor) as cur:
+                    await cur.execute(
+                        f'SELECT count(cm.id) as unread_message_count FROM chat_message cm'
+                        f' LEFT OUTER JOIN read_message rm ON rm.message_id = cm.id'
+                        f' WHERE cm.chat_id = %(chat_id)s AND cm.author_id != %(user_id)s AND rm.id IS NULL '
+                        f' {exclude_ids_sql} ',
+                        dict(
+                            chat_id=self.chat_id,
+                            user_id=user_id,
+                            **extra_params
+                        )
+                    )
+                    unread_message_count += (await cur.fetchone())['unread_message_count']
+
+        return unread_message_count
 
     @classmethod
     async def get_or_create(cls, user_id, friend_id, conn: aiomysql.Connection):

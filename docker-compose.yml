@@ -26,6 +26,7 @@ services:
 
   backend:
     user: "1000:1000"
+    image: socnet_chat_backend
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -33,8 +34,8 @@ services:
     environment:
       WAIT_HOSTS: db:3306, db_shard_1:3306, db_shard_2:3306
       WAIT_HOSTS_TIMEOUT: 300
-      WAIT_SLEEP_INTERVAL: 30
-      WAIT_HOST_CONNECT_TIMEOUT: 30
+      WAIT_SLEEP_INTERVAL: 3
+      WAIT_HOST_CONNECT_TIMEOUT: 3
 
       FERNET_KEY: 'sIv6jBFwPkNSZP4gVUmzQUnsaMs7g1g7UMRStf5RpCM='
       DATABASE_URL: mysql://socnet:socnetpass@db:3306/socnet
@@ -43,11 +44,13 @@ services:
       SHARD_2_URL: mysql://socnet:socnetpass@db_shard_2:3306/socnet
 
       PORT: 8080
+      REST_PORT: 8081
 
     volumes:
       - ./backend:/app
-    ports:
-      - 8088:8080
+    expose:
+      - 8080
+      - 8081
     # depends_on:
     #   - db
     #   - db_shard_1

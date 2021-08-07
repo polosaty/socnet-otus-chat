@@ -324,7 +324,7 @@ async def migrate_schema(pool):
 async def make_app(host, port):
     database_url = os.getenv('DATABASE_URL', None)
 
-    app['instance_id'] = os.getenv('INSTANCE_ID', '1')
+    app['instance_id'] = os.getenv('INSTANCE_ID', os.getenv('HOSTNAME', '1'))
     jaeger_address = os.getenv('JAEGER_ADDRESS')
     if jaeger_address:
         endpoint = az.create_endpoint(f"chat_backend_{app['instance_id']}", ipv4=host, port=port)
@@ -522,7 +522,7 @@ async def rest_make_chat_handler(request: web.Request):
 
 async def make_rest(host, port):
     rest = web.Application()
-    rest['instance_id'] = os.getenv('INSTANCE_ID', '1')
+    rest['instance_id'] = os.getenv('INSTANCE_ID', os.getenv('HOSTNAME', '1'))
     jaeger_address = os.getenv('JAEGER_ADDRESS', 'http://jaeger:9411/api/v2/spans')
     endpoint = az.create_endpoint(f"chat_rest_{rest['instance_id']}", ipv4=host, port=port)
     tracer = await az.create(jaeger_address, endpoint, sample_rate=1.0)

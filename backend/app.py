@@ -19,11 +19,15 @@ import anyio
 from cryptography import fernet
 import socketio
 
+from metrics import handle_metrics
+from metrics import init_metrics
+from metrics import request_timer
 from models import Chat
 from models import Message
 from models import User
 from utils import close_db_pool
 from utils import extract_database_credentials
+from zipkin_monkeypatch import _set_span_properties
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +39,7 @@ ChatSession = namedtuple('ChatSession', ['chat_id', 'chat_key', 'user_id', 'q', 
 
 
 @sio.event
+@request_timer({'route': 'message_get'})
 async def message_get(sid):
     if sid not in app['sessions']:
         await sio.emit('error', {'data': 'sid not in sessions'}, room=sid)
@@ -65,6 +70,7 @@ async def message_get(sid):
 
 
 @sio.event
+@request_timer({'route': 'messages_read'})
 async def messages_read(sid, message_ids: List[int]):
     if sid not in app['sessions']:
         await sio.emit('error', {'data': 'sid not in sessions'}, room=sid)
@@ -144,6 +150,7 @@ async def collect_messages(messages_queue: asyncio.Queue):
 
 
 @sio.event
+@request_timer({'route': 'message_add'})
 async def message_add(sid, message):
     if sid not in app['sessions']:
         await sio.emit('error', {'data': 'sid not in sessions'}, room=sid)
@@ -202,6 +209,7 @@ async def close_room(sid, message):
 
 
 @sio.event
+@request_timer({'route': 'disconnect_request'})
 async def disconnect_request(sid):
     await sio.disconnect(sid)
 
@@ -212,6 +220,7 @@ async def disconnect_with_error(sid, error):
 
 
 @sio.event
+@request_timer({'route': 'connect'})
 async def connect(sid, environ):
     request = environ['aiohttp.request']
     chat_key = request.query.get('chat_key')
@@ -326,6 +335,7 @@ async def make_app(host, port):
 
     app['instance_id'] = os.getenv('INSTANCE_ID', os.getenv('HOSTNAME', '1'))
     jaeger_address = os.getenv('JAEGER_ADDRESS')
+    az.aiohttp_helpers._set_span_properties = _set_span_properties
     if jaeger_address:
         endpoint = az.create_endpoint(f"chat_backend_{app['instance_id']}", ipv4=host, port=port)
         tracer = await az.create(jaeger_address, endpoint, sample_rate=1.0)
@@ -495,6 +505,7 @@ async def run_app(public_port=8080, public_host='0.0.0.0', rest_port=8081, rest_
         logger.exception('run_app: %r', ex)
 
 
+@request_timer({'route': '/make_chat/'})
 async def rest_make_chat_handler(request: web.Request):
     tracer = az.get_tracer(request.app)
     span = az.request_span(request)
@@ -522,15 +533,22 @@ async def rest_make_chat_handler(request: web.Request):
 
 async def make_rest(host, port):
     rest = web.Application()
+    rest['main_app'] = app
     rest['instance_id'] = os.getenv('INSTANCE_ID', os.getenv('HOSTNAME', '1'))
-    jaeger_address = os.getenv('JAEGER_ADDRESS', 'http://jaeger:9411/api/v2/spans')
-    endpoint = az.create_endpoint(f"chat_rest_{rest['instance_id']}", ipv4=host, port=port)
-    tracer = await az.create(jaeger_address, endpoint, sample_rate=1.0)
+    jaeger_address = os.getenv('JAEGER_ADDRESS')
+    az.aiohttp_helpers._set_span_properties = _set_span_properties
 
+    if jaeger_address:
+        endpoint = az.create_endpoint(f"chat_rest_{rest['instance_id']}", ipv4=host, port=port)
+        tracer = await az.create(jaeger_address, endpoint, sample_rate=1.0)
+
+    await init_metrics(app)
     rest.add_routes([
-        web.post("/make_chat/", rest_make_chat_handler)
+        web.post("/make_chat/", rest_make_chat_handler),
+        web.get("/metrics", handle_metrics)
     ])
-    az.setup(rest, tracer)
+    if jaeger_address:
+        az.setup(rest, tracer)
     return rest
 
 
